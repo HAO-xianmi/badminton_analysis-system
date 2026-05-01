@@ -42,7 +42,12 @@ class Visualizer:
         self.position_history = defaultdict(lambda: deque(maxlen=self.HISTORY_LENGTH))
         self.stay_counts = defaultdict(int)
         self.frames = []
-        self.distance_history = defaultdict(list)
+        self.p1_dist_history = []
+        self.p2_dist_history = []
+        self.distance_history = {
+            1: self.p1_dist_history,
+            2: self.p2_dist_history,
+        }
         self.total_distances = {1: 0.0, 2: 0.0}
         self.rally_history = []
         self.rally_font = self._load_rally_font()
@@ -71,6 +76,18 @@ class Visualizer:
     def save_video(self, output_path):
         """Placeholder for future video export."""
         raise NotImplementedError("Video export is not implemented yet.")
+
+    def reset_rally_chart(self):
+        """Clear per-rally distance chart data after a confirmed score change."""
+        self.frames = []
+        self.p1_dist_history = []
+        self.p2_dist_history = []
+        self.distance_history = {
+            1: self.p1_dist_history,
+            2: self.p2_dist_history,
+        }
+        self.cached_panel = None
+        self.cached_padded_panel = None
 
     def _update_history(self, frame_index, tracking_data, metrics):
         self.frames.append(frame_index)

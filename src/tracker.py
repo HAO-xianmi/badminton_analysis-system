@@ -15,18 +15,20 @@ class PlayerIDMapper:
     def __init__(self):
         self.total_dist = {1: 0.0, 2: 0.0}
         self.last_pos = {1: None, 2: None}
+        self.side_flipped = False
 
-    def get_player_id(self, court_pos):
+    def get_player_id(self, court_pos, side_flipped=False):
         """Return stable player id from court y coordinate."""
-        if court_pos[1] < 670:
-            return 1
-        return 2
+        y = court_pos[1]
+        if not side_flipped:
+            return 1 if y < 670 else 2
+        return 2 if y < 670 else 1
 
     def update(self, raw_tracks):
         """Return Dict[player_id, court_pos] from Dict[raw_id, court_pos]."""
         result = {}
         for raw_id, pos in sorted(raw_tracks.items()):
-            player_id = self.get_player_id(pos)
+            player_id = self.get_player_id(pos, self.side_flipped)
             result[player_id] = pos
             self.last_pos[player_id] = pos
 
@@ -48,6 +50,7 @@ class Tracker:
         self.confidence_threshold = confidence_threshold
         self.tracker_config = self._ensure_tracker_config()
         self.id_mapper = PlayerIDMapper()
+        self.mapper = self.id_mapper
 
     def _ensure_tracker_config(self):
         """Create a ByteTrack config that preserves tracks through short rally gaps."""
@@ -93,7 +96,10 @@ class Tracker:
         bbox_by_track_id = {}
 
         for raw_id, player in sorted(players.items()):
-            player_id = self.id_mapper.get_player_id(player["court_point"])
+            player_id = self.id_mapper.get_player_id(
+                player["court_point"],
+                self.id_mapper.side_flipped,
+            )
             if player_id is None or player_id not in tracking_data:
                 continue
             if tracking_data[player_id] != player["court_point"]:

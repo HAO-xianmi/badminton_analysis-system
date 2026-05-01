@@ -2,19 +2,155 @@
 
 import argparse
 import re
+import shutil
+import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from queue import Empty, Full, Queue
 
 import cv2
 import easyocr
+import ffmpeg
 import torch
 
 from analyzer import Analyzer, track_frame_with_bbox
 from detector import Detector
-from tracker import Tracker, open_video_at_start
+from tracker import Tracker
 from visualizer import Visualizer
+
+
+def open_video_at_start(video_path, start_seconds):
+    """Open a video with FFMPEG hardware acceleration and seek to start time."""
+    capture = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
+    if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_ANY"):
+        capture.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    capture.set(cv2.CAP_PROP_POS_MSEC, start_seconds * 1000)
+    return capture
+
+
+def find_ffmpeg_executable():
+    """Return ffmpeg from PATH or the WinGet install location."""
+    executable = shutil.which("ffmpeg")
+    if executable:
+        return executable
+
+    package_root = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
+    if package_root.exists():
+        matches = sorted(package_root.glob("Gyan.FFmpeg_*/ffmpeg-*/bin/ffmpeg.exe"))
+        if matches:
+            return str(matches[-1])
+
+    common_paths = [
+        Path("C:/Program Files/ffmpeg/bin/ffmpeg.exe"),
+        Path("C:/Program Files/Gyan/ffmpeg/bin/ffmpeg.exe"),
+        Path("C:/ffmpeg/bin/ffmpeg.exe"),
+    ]
+    for candidate in common_paths:
+        if candidate.exists():
+            return str(candidate)
+
+    raise RuntimeError("ffmpeg executable not found. Install it with: winget install ffmpeg")
+
+
+class FFmpegVideoWriter:
+    """Write raw BGR frames to an ffmpeg NVENC subprocess."""
+
+    def __init__(self, output_path, fps, frame_size):
+        self.output_path = Path(output_path)
+        self.fps = fps
+        self.width, self.height = frame_size
+        self.stderr_lines = deque(maxlen=50)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        stream = ffmpeg.input(
+            "pipe:0",
+            format="rawvideo",
+            vcodec="rawvideo",
+            s=f"{self.width}x{self.height}",
+            pix_fmt="bgr24",
+            r=str(self.fps),
+        ).output(
+            str(self.output_path),
+            vcodec="h264_nvenc",
+            preset="fast",
+            crf="18",
+        )
+        self.command = ffmpeg.compile(stream.overwrite_output(), cmd=find_ffmpeg_executable())
+        self.process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self.stderr_thread.start()
+
+    def _drain_stderr(self):
+        if self.process.stderr is None:
+            return
+        for line in self.process.stderr:
+            self.stderr_lines.append(line.decode("utf-8", errors="replace").rstrip())
+
+    def write(self, frame):
+        """Write one BGR frame to ffmpeg stdin."""
+        if self.process.stdin is None:
+            raise RuntimeError("ffmpeg stdin is not available")
+
+        return_code = self.process.poll()
+        if return_code is not None:
+            raise RuntimeError(self._format_error(return_code))
+
+        try:
+            self.process.stdin.write(frame.tobytes())
+        except BrokenPipeError as error:
+            return_code = self.process.poll()
+            raise RuntimeError(self._format_error(return_code)) from error
+
+    def release(self):
+        """Finish encoding and wait for ffmpeg to exit."""
+        if self.process.stdin is not None and not self.process.stdin.closed:
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+        return_code = self.process.wait()
+        if self.stderr_thread is not None:
+            self.stderr_thread.join(timeout=1.0)
+
+        if return_code != 0:
+            raise RuntimeError(self._format_error(return_code))
+
+    def _format_error(self, return_code):
+        message = f"ffmpeg exited with code {return_code}"
+        if self.stderr_lines:
+            message += ":\n" + "\n".join(self.stderr_lines)
+        return message
+
+
+def check_side_flip(p1, p2, set_number, decided_sets, side_flipped):
+    """Return whether the set ended, next set number, and side-flip state."""
+
+    def set_over(a, b):
+        if max(a, b) >= 30:
+            return True
+        if max(a, b) >= 21 and abs(a - b) >= 2:
+            return True
+        return False
+
+    if set_over(p1, p2) and decided_sets < set_number:
+        return True, min(set_number + 1, 3), not side_flipped
+
+    if set_number == 3 and max(p1, p2) == 11 and not side_flipped:
+        return False, set_number, not side_flipped
+
+    return False, set_number, side_flipped
 
 
 class BadmintonAnalysisApp:
@@ -29,7 +165,10 @@ class BadmintonAnalysisApp:
     SCORE_OCR_INTERVAL = 15
     SCORE_ROI = (60, 120, 380, 700)
     SCORE_DIGITS_ROI = (50, 135, 630, 705)
-    SCORE_CHANGE_CONFIRMATIONS = 2
+    SCORE_CHANGE_CONFIRMATIONS = 3
+    MIN_RALLY_FRAME_GAP = 200
+    MISSING_PLAYER_CONFIRM_FRAMES = 100
+    FALLBACK_RALLY_FRAME_GAP = 300
 
     def __init__(self, video_path, calibration_path, output_path, start_seconds=0):
         self.video_path = Path(video_path)
@@ -44,6 +183,12 @@ class BadmintonAnalysisApp:
         self.score_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
         self.prev_score = None
         self.score_confirm_count = 0
+        self.last_rally_frame = -max(self.MIN_RALLY_FRAME_GAP, self.FALLBACK_RALLY_FRAME_GAP)
+        self.missing_frames = 0
+        self.set_number = 1
+        self.side_flipped = False
+        self.set_scores = {1: [0, 0], 2: [0, 0], 3: [0, 0]}
+        self.decided_sets = 0
 
     def run(self, max_frames=None, duration_seconds=None):
         """Process the video, save visualization output, and return final metrics."""
@@ -109,6 +254,13 @@ class BadmintonAnalysisApp:
                     writer.write(output_frame)
                 except Exception as error:
                     writer_error.append(error)
+                    stop_writer.set()
+                    while True:
+                        try:
+                            write_queue.get_nowait()
+                            write_queue.task_done()
+                        except Empty:
+                            break
                     break
                 finally:
                     write_queue.task_done()
@@ -125,6 +277,7 @@ class BadmintonAnalysisApp:
                     break
 
                 frame_start_time = time.perf_counter()
+                self.tracker.mapper.side_flipped = self.side_flipped
 
                 if frame_index % self.TRACKING_INTERVAL == 0 or not has_cached_tracking:
                     stage_start_time = time.perf_counter()
@@ -153,6 +306,7 @@ class BadmintonAnalysisApp:
 
                 stage_start_time = time.perf_counter()
                 is_live = self._is_live_frame(frame)
+                rally_closed_this_frame = False
                 if is_live:
                     score = self._read_score(frame, frame_index)
                     if score is not None:
@@ -161,13 +315,37 @@ class BadmintonAnalysisApp:
                             self.score_confirm_count = 0
                         if score != self.prev_score:
                             self.score_confirm_count += 1
-                            if self.score_confirm_count >= self.SCORE_CHANGE_CONFIRMATIONS:
+                            if (
+                                self.score_confirm_count >= self.SCORE_CHANGE_CONFIRMATIONS
+                                and frame_index - self.last_rally_frame >= self.MIN_RALLY_FRAME_GAP
+                            ):
                                 self.analyzer.close_current_rally()
+                                self.visualizer.reset_rally_chart()
                                 self.prev_score = score
+                                self._update_side_flip_state(score)
                                 self.score_confirm_count = 0
+                                self.last_rally_frame = frame_index
+                                rally_closed_this_frame = True
                         else:
                             self.score_confirm_count = 0
 
+                current_players = cached_tracking_data if is_live else {}
+                if len(current_players) == 0:
+                    self.missing_frames += 1
+                else:
+                    self.missing_frames = 0
+
+                if (
+                    not rally_closed_this_frame
+                    and self.missing_frames >= self.MISSING_PLAYER_CONFIRM_FRAMES
+                    and frame_index - self.last_rally_frame >= self.FALLBACK_RALLY_FRAME_GAP
+                ):
+                    self.analyzer.close_current_rally()
+                    self.visualizer.reset_rally_chart()
+                    self.last_rally_frame = frame_index
+                    self.missing_frames = 0
+
+                if is_live:
                     final_metrics = self.analyzer.analyze(cached_tracking_data)
                 else:
                     final_metrics = self.analyzer.get_metrics()
@@ -189,17 +367,32 @@ class BadmintonAnalysisApp:
                     writer_thread.start()
 
                 stage_start_time = time.perf_counter()
-                write_queue.put(output_frame)
+                while True:
+                    if writer_error:
+                        raise RuntimeError("Video writer failed") from writer_error[0]
+                    try:
+                        write_queue.put(output_frame, timeout=0.1)
+                        break
+                    except Full:
+                        continue
                 stage_times["write"] += time.perf_counter() - stage_start_time
                 total_processing_time += time.perf_counter() - frame_start_time
 
                 if writer_error:
                     raise RuntimeError("Video writer failed") from writer_error[0]
 
-                if (frame_index + 1) % 100 == 0:
+                self.tracker.mapper.side_flipped = self.side_flipped
+
+                if (frame_index + 1) % 1000 == 0:
                     player1 = final_metrics.get(1, {}).get("distance_m", 0.0)
                     player2 = final_metrics.get(2, {}).get("distance_m", 0.0)
-                    print(f"Frame {frame_index + 1}, Player1: {player1:.2f}m, Player2: {player2:.2f}m")
+                    average_frame_time_ms = total_processing_time / (frame_index + 1) * 1000.0
+                    print(
+                        f"Frame {frame_index + 1}, "
+                        f"Player1: {player1:.2f}m, "
+                        f"Player2: {player2:.2f}m, "
+                        f"Average frame time: {average_frame_time_ms:.2f} ms"
+                    )
 
                 frame_index += 1
         finally:
@@ -273,15 +466,32 @@ class BadmintonAnalysisApp:
             return digits[0], digits[1]
         return None
 
+    def _update_side_flip_state(self, score):
+        """Update set score bookkeeping and flip court-side mapping when needed."""
+        p1, p2 = score
+        self.set_scores[self.set_number] = [p1, p2]
+        set_finished, next_set_number, next_side_flipped = check_side_flip(
+            p1,
+            p2,
+            self.set_number,
+            self.decided_sets,
+            self.side_flipped,
+        )
+
+        side_flipped_changed = next_side_flipped != self.side_flipped
+        if set_finished:
+            self.decided_sets += 1
+
+        self.set_number = next_set_number
+        self.side_flipped = next_side_flipped
+
+        if side_flipped_changed:
+            print(f"换边！当前局：{self.set_number}，side_flipped：{self.side_flipped}")
+
     def _create_writer(self, output_frame, fps):
-        """Create a VideoWriter for the visualized output."""
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        """Create an ffmpeg NVENC writer for the visualized output."""
         height, width = output_frame.shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(self.output_path), fourcc, fps, (width, height))
-        if not writer.isOpened():
-            raise RuntimeError(f"Cannot open video writer: {self.output_path}")
-        return writer
+        return FFmpegVideoWriter(self.output_path, fps, (width, height))
 
 
 def parse_args():
@@ -314,9 +524,11 @@ def main():
 
     player1 = final_metrics.get(1, {}).get("distance_m", 0.0)
     player2 = final_metrics.get(2, {}).get("distance_m", 0.0)
+    rally_count = len(final_metrics.get("rally_history", []))
     print(f"Finished processing {processed_frames} frames")
     print(f"Player1 total distance: {player1:.2f}m")
     print(f"Player2 total distance: {player2:.2f}m")
+    print(f"Rally count: {rally_count}")
     print(f"Average frame time: {average_frame_time_ms:.2f} ms")
     for name, elapsed_ms in average_stage_times_ms.items():
         print(f"Average {name} time: {elapsed_ms:.2f} ms")
