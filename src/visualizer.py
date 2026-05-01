@@ -31,6 +31,11 @@ class Visualizer:
     HISTORY_LENGTH = 80
     PANEL_RENDER_INTERVAL = 3
     TOTAL_DISTANCE_TEXT_HEIGHT = 30
+    COURT_HORIZONTAL_LINES = (0, 72, 460, 670, 880, 1268, 1340)
+    COURT_FULL_VERTICAL_LINES = (0, 46, 564, 610)
+    COURT_CENTER_X = 305
+    COURT_CENTER_LINE_Y1 = 460
+    COURT_CENTER_LINE_Y2 = 880
     PLAYER_COLORS = {
         1: (0, 255, 0),
         2: (255, 0, 0),
@@ -76,6 +81,10 @@ class Visualizer:
     def save_video(self, output_path):
         """Placeholder for future video export."""
         raise NotImplementedError("Video export is not implemented yet.")
+
+    def draw_court(self):
+        """Return a clean top-down court view for standalone inspection."""
+        return self.court_background.copy()
 
     def reset_rally_chart(self):
         """Clear per-rally distance chart data after a confirmed score change."""
@@ -132,27 +141,25 @@ class Visualizer:
     def _create_court_background(self):
         court = np.full((self.COURT_HEIGHT, self.PANEL_WIDTH, 3), (38, 128, 54), dtype=np.uint8)
         white = (255, 255, 255)
+        left = self._scale_x(0)
+        right = self._scale_x(self.SOURCE_WIDTH)
+        top = self._scale_y(0)
+        bottom = self._scale_y(self.SOURCE_HEIGHT)
 
-        cv2.rectangle(court, (0, 0), (self.PANEL_WIDTH - 1, self.COURT_HEIGHT - 1), white, 2)
+        cv2.rectangle(court, (left, top), (right, bottom), white, 2)
 
-        vertical_lines = [
-            0,
-            self.SOURCE_WIDTH * 46 / 610,
-            self.SOURCE_WIDTH / 2,
-            self.SOURCE_WIDTH * (610 - 46) / 610,
-            self.SOURCE_WIDTH,
-        ]
-        for x in vertical_lines:
+        for x in self.COURT_FULL_VERTICAL_LINES:
             view_x = self._scale_x(x)
-            cv2.line(court, (view_x, 0), (view_x, self.COURT_HEIGHT - 1), white, 1)
+            cv2.line(court, (view_x, top), (view_x, bottom), white, 1)
 
-        center_y = self._scale_y(670)
-        cv2.line(court, (0, center_y), (self.PANEL_WIDTH - 1, center_y), white, 1)
+        center_x = self._scale_x(self.COURT_CENTER_X)
+        center_y1 = self._scale_y(self.COURT_CENTER_LINE_Y1)
+        center_y2 = self._scale_y(self.COURT_CENTER_LINE_Y2)
+        cv2.line(court, (center_x, center_y1), (center_x, center_y2), white, 1)
 
-        service_offset = self.SOURCE_HEIGHT / 6
-        for y in (service_offset, self.SOURCE_HEIGHT - service_offset):
+        for y in self.COURT_HORIZONTAL_LINES:
             view_y = self._scale_y(y)
-            cv2.line(court, (0, view_y), (self.PANEL_WIDTH - 1, view_y), white, 1)
+            cv2.line(court, (left, view_y), (right, view_y), white, 1)
 
         return court
 
@@ -419,10 +426,18 @@ class Visualizer:
         return self._scale_x(x), self._scale_y(y)
 
     def _scale_x(self, x):
-        return int(round(float(x) / self.SOURCE_WIDTH * (self.PANEL_WIDTH - 1)))
+        display_width = int(round(self.SOURCE_WIDTH * self._court_scale()))
+        left = (self.PANEL_WIDTH - display_width) // 2
+        scaled_x = int(round(float(x) * self._court_scale()))
+        scaled_x = min(max(scaled_x, 0), display_width - 1)
+        return left + scaled_x
 
     def _scale_y(self, y):
-        return int(round(float(y) / self.SOURCE_HEIGHT * (self.COURT_HEIGHT - 1)))
+        scaled_y = int(round(float(y) * self._court_scale()))
+        return min(max(scaled_y, 0), self.COURT_HEIGHT - 1)
+
+    def _court_scale(self):
+        return self.COURT_HEIGHT / self.SOURCE_HEIGHT
 
 
 def parse_args():

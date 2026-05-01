@@ -12,7 +12,6 @@ from queue import Empty, Full, Queue
 
 import cv2
 import easyocr
-import ffmpeg
 import torch
 
 from analyzer import Analyzer, track_frame_with_bbox
@@ -56,7 +55,39 @@ def find_ffmpeg_executable():
         if candidate.exists():
             return str(candidate)
 
-    raise RuntimeError("ffmpeg executable not found. Install it with: winget install ffmpeg")
+    raise RuntimeError("ffmpeg executable not found. Install it with: winget install --id Gyan.FFmpeg -e")
+
+
+def create_writer(output_path, fps, width, height):
+    """Create an ffmpeg NVENC process that accepts raw BGR frames on stdin."""
+    width = width if width % 2 == 0 else width + 1
+    height = height if height % 2 == 0 else height + 1
+    cmd = [
+        find_ffmpeg_executable(),
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{width}x{height}",
+        "-pix_fmt",
+        "bgr24",
+        "-r",
+        str(int(fps)),
+        "-i",
+        "pipe:0",
+        "-vcodec",
+        "h264_nvenc",
+        "-preset",
+        "fast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 class FFmpegVideoWriter:
@@ -65,29 +96,13 @@ class FFmpegVideoWriter:
     def __init__(self, output_path, fps, frame_size):
         self.output_path = Path(output_path)
         self.fps = fps
-        self.width, self.height = frame_size
+        source_width, source_height = frame_size
+        self.width = source_width if source_width % 2 == 0 else source_width + 1
+        self.height = source_height if source_height % 2 == 0 else source_height + 1
         self.stderr_lines = deque(maxlen=50)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        stream = ffmpeg.input(
-            "pipe:0",
-            format="rawvideo",
-            vcodec="rawvideo",
-            s=f"{self.width}x{self.height}",
-            pix_fmt="bgr24",
-            r=str(self.fps),
-        ).output(
-            str(self.output_path),
-            vcodec="h264_nvenc",
-            preset="fast",
-            crf="18",
-        )
-        self.command = ffmpeg.compile(stream.overwrite_output(), cmd=find_ffmpeg_executable())
-        self.process = subprocess.Popen(
-            self.command,
-            stdin=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        self.process = create_writer(self.output_path, self.fps, self.width, self.height)
         self.stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self.stderr_thread.start()
 
@@ -105,6 +120,17 @@ class FFmpegVideoWriter:
         return_code = self.process.poll()
         if return_code is not None:
             raise RuntimeError(self._format_error(return_code))
+
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.copyMakeBorder(
+                frame,
+                0,
+                self.height - frame.shape[0],
+                0,
+                self.width - frame.shape[1],
+                cv2.BORDER_CONSTANT,
+                value=(0, 0, 0),
+            )
 
         try:
             self.process.stdin.write(frame.tobytes())
@@ -189,6 +215,7 @@ class BadmintonAnalysisApp:
         self.side_flipped = False
         self.set_scores = {1: [0, 0], 2: [0, 0], 3: [0, 0]}
         self.decided_sets = 0
+        self.side_flip_count = 0
 
     def run(self, max_frames=None, duration_seconds=None):
         """Process the video, save visualization output, and return final metrics."""
@@ -388,10 +415,9 @@ class BadmintonAnalysisApp:
                     player2 = final_metrics.get(2, {}).get("distance_m", 0.0)
                     average_frame_time_ms = total_processing_time / (frame_index + 1) * 1000.0
                     print(
-                        f"Frame {frame_index + 1}, "
-                        f"Player1: {player1:.2f}m, "
-                        f"Player2: {player2:.2f}m, "
-                        f"Average frame time: {average_frame_time_ms:.2f} ms"
+                        f"Frame {frame_index + 1} | "
+                        f"P1: {player1:.2f}m P2: {player2:.2f}m | "
+                        f"avg: {average_frame_time_ms:.2f}ms"
                     )
 
                 frame_index += 1
@@ -486,7 +512,8 @@ class BadmintonAnalysisApp:
         self.side_flipped = next_side_flipped
 
         if side_flipped_changed:
-            print(f"换边！当前局：{self.set_number}，side_flipped：{self.side_flipped}")
+            self.side_flip_count += 1
+            print(f"Side flip | set: {self.set_number} | side_flipped: {self.side_flipped}")
 
     def _create_writer(self, output_frame, fps):
         """Create an ffmpeg NVENC writer for the visualized output."""
@@ -529,6 +556,7 @@ def main():
     print(f"Player1 total distance: {player1:.2f}m")
     print(f"Player2 total distance: {player2:.2f}m")
     print(f"Rally count: {rally_count}")
+    print(f"Side flip count: {app.side_flip_count}")
     print(f"Average frame time: {average_frame_time_ms:.2f} ms")
     for name, elapsed_ms in average_stage_times_ms.items():
         print(f"Average {name} time: {elapsed_ms:.2f} ms")
