@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local data and generated outputs
+data/raw/*
+!data/raw/.gitkeep
+data/output/*
+!data/output/.gitkeep
+data/logs/*.log
+
+# Local models and task assets
+*.pt
+*.task
+*.npy
+
+# OS/editor clutter
+.DS_Store
+Thumbs.db
