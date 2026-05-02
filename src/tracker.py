@@ -12,7 +12,8 @@ from ultralytics import YOLO
 class PlayerIDMapper:
     """Map raw tracks to player ids by fixed court half."""
 
-    def __init__(self):
+    def __init__(self, court_h_threshold=670):
+        self.court_h_threshold = court_h_threshold
         self.total_dist = {1: 0.0, 2: 0.0}
         self.last_pos = {1: None, 2: None}
         self.side_flipped = False
@@ -21,8 +22,8 @@ class PlayerIDMapper:
         """Return stable player id from court y coordinate."""
         y = court_pos[1]
         if not side_flipped:
-            return 1 if y < 670 else 2
-        return 2 if y < 670 else 1
+            return 1 if y < self.court_h_threshold else 2
+        return 2 if y < self.court_h_threshold else 1
 
     def update(self, raw_tracks):
         """Return Dict[player_id, court_pos] from Dict[raw_id, court_pos]."""
@@ -41,7 +42,13 @@ class Tracker:
     TRACKER_CONFIG = Path(r"F:\Fun-Activities\badminton_analysis\data\logs\bytetrack.yaml")
     YOLO_IMAGE_SIZE = 416
 
-    def __init__(self, calibration_path, model_name="yolov8s.pt", confidence_threshold=0.5):
+    def __init__(
+        self,
+        calibration_path,
+        model_name="yolov8s.pt",
+        confidence_threshold=0.5,
+        court_h_threshold=670,
+    ):
         self.h_matrix = np.load(calibration_path)
         self.model = YOLO(model_name)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -49,7 +56,7 @@ class Tracker:
         self.use_half = self.device == "cuda"
         self.confidence_threshold = confidence_threshold
         self.tracker_config = self._ensure_tracker_config()
-        self.id_mapper = PlayerIDMapper()
+        self.id_mapper = PlayerIDMapper(court_h_threshold=court_h_threshold)
         self.mapper = self.id_mapper
 
     def _ensure_tracker_config(self):

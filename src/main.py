@@ -12,10 +12,15 @@ from queue import Empty, Full, Queue
 
 import cv2
 import easyocr
+import numpy as np
 import torch
 
 from analyzer import Analyzer, track_frame_with_bbox
+from ball_analyzer import BallAnalyzer
+from ball_detector import BallDetector
+from ball_tracker import BallTracker
 from detector import Detector
+from source_manager import SourceManager
 from tracker import Tracker
 from visualizer import Visualizer
 
@@ -32,6 +37,43 @@ def open_video_at_start(video_path, start_seconds):
 
     capture.set(cv2.CAP_PROP_POS_MSEC, start_seconds * 1000)
     return capture
+
+
+def detect_scene_cut(prev_frame, curr_frame, threshold=20):
+    """Return True when adjacent frames differ enough to be a scene cut."""
+    mean_brightness = curr_frame.mean()
+    if mean_brightness < 30:
+        return True
+    if prev_frame is None:
+        return False
+    diff = cv2.absdiff(prev_frame, curr_frame)
+    mean_diff = diff.mean()
+    return mean_diff > threshold
+
+
+def is_valid_court_view(frame, H):
+    """Return True when the calibrated court is visible in the current frame."""
+    court_corners = np.float32([[0, 0], [610, 0], [610, 1340], [0, 1340]])
+    H_inv = np.linalg.inv(H)
+    img_corners = cv2.perspectiveTransform(
+        court_corners.reshape(-1, 1, 2),
+        H_inv,
+    ).reshape(-1, 2)
+    h, w = frame.shape[:2]
+    in_frame_count = sum(1 for p in img_corners if 0 <= p[0] <= w and 0 <= p[1] <= h)
+    if in_frame_count < 2:
+        return False
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [img_corners.astype(np.int32)], 255)
+    court_area = cv2.countNonZero(mask)
+    if court_area == 0:
+        return False
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(hsv, (35, 45, 35), (95, 255, 255))
+    green_ratio = cv2.countNonZero(cv2.bitwise_and(green_mask, green_mask, mask=mask)) / court_area
+    return green_ratio >= 0.08
 
 
 def find_ffmpeg_executable():
@@ -189,38 +231,88 @@ class BadmintonAnalysisApp:
     SCOREBOARD_WHITE_THRESHOLD = 0.05
     SCOREBOARD_SCAN_STEP = 50
     SCORE_OCR_INTERVAL = 15
-    SCORE_ROI = (60, 120, 380, 700)
-    SCORE_DIGITS_ROI = (50, 135, 630, 705)
     SCORE_CHANGE_CONFIRMATIONS = 3
     MIN_RALLY_FRAME_GAP = 200
     MISSING_PLAYER_CONFIRM_FRAMES = 100
     FALLBACK_RALLY_FRAME_GAP = 300
 
-    def __init__(self, video_path, calibration_path, output_path, start_seconds=0):
+    def __init__(
+        self,
+        video_path,
+        calibration_path,
+        output_path,
+        start_seconds=0,
+        fps=None,
+        score_roi=None,
+        court_h_threshold=None,
+        side_flipped=False,
+    ):
         self.video_path = Path(video_path)
         self.calibration_path = Path(calibration_path)
         self.output_path = Path(output_path)
         self.start_seconds = start_seconds
+        self.config_fps = fps
+        self.score_roi = self._normalize_score_roi(score_roi)
+        if court_h_threshold is None:
+            raise ValueError("Source config is missing court_h_threshold.")
+        self.court_h_threshold = court_h_threshold
 
         self.detector = Detector()
-        self.tracker = Tracker(str(self.calibration_path))
+        self.tracker = Tracker(
+            str(self.calibration_path),
+            court_h_threshold=self.court_h_threshold,
+        )
         self.analyzer = Analyzer()
         self.visualizer = Visualizer()
+        self.ball_detector = None
+        self.ball_tracker = None
+        self.ball_analyzer = None
+        self.ball_h_matrix = None
+        self.ball_detected_frames = 0
+        self._init_ball_pipeline()
         self.score_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
         self.prev_score = None
         self.score_confirm_count = 0
         self.last_rally_frame = -max(self.MIN_RALLY_FRAME_GAP, self.FALLBACK_RALLY_FRAME_GAP)
         self.missing_frames = 0
         self.set_number = 1
-        self.side_flipped = False
+        self.side_flipped = side_flipped
         self.set_scores = {1: [0, 0], 2: [0, 0], 3: [0, 0]}
         self.decided_sets = 0
         self.side_flip_count = 0
 
+    def _init_ball_pipeline(self):
+        """Initialize shuttlecock speed analysis when TrackNet weights exist."""
+        weights_path = Path(__file__).resolve().parent / "tracknet_weights.pt"
+        if not weights_path.exists():
+            print(f"Ball speed disabled: TrackNetV2 weights not found at {weights_path}")
+            return
+
+        try:
+            h_matrix = np.load(str(self.calibration_path))
+            self.ball_detector = BallDetector(
+                weights_path,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            self.ball_tracker = BallTracker()
+            self.ball_analyzer = BallAnalyzer(
+                h_matrix,
+                fps=self.config_fps or 50.0,
+                csv_path=Path("F:/Fun-Activities/badminton_analysis/data/logs/ball_speeds.csv"),
+            )
+            self.ball_h_matrix = h_matrix
+            print(f"Ball speed enabled: {weights_path}")
+        except Exception as error:
+            self.ball_detector = None
+            self.ball_tracker = None
+            self.ball_analyzer = None
+            self.ball_h_matrix = None
+            print(f"Ball speed disabled: failed to initialize TrackNetV2 ({error})")
+
     def run(self, max_frames=None, duration_seconds=None):
         """Process the video, save visualization output, and return final metrics."""
         capture = open_video_at_start(self.video_path, self.start_seconds)
-        fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+        fps = self.config_fps or capture.get(cv2.CAP_PROP_FPS) or 30.0
         if duration_seconds is not None:
             duration_frames = max(0, int(round(duration_seconds * fps)))
             max_frames = duration_frames if max_frames is None else min(max_frames, duration_frames)
@@ -244,6 +336,8 @@ class BadmintonAnalysisApp:
         stop_reader = threading.Event()
         stop_writer = threading.Event()
         writer_error = []
+        prev_frame = None
+        scene_cut_cooldown = 0
 
         def read_frames():
             while not stop_reader.is_set():
@@ -304,6 +398,14 @@ class BadmintonAnalysisApp:
                     break
 
                 frame_start_time = time.perf_counter()
+                valid_court_view = self._is_valid_ball_view(frame)
+                if detect_scene_cut(prev_frame, frame) or not valid_court_view:
+                    scene_cut_cooldown = 3
+                scene_cut_active = scene_cut_cooldown > 0
+                if scene_cut_active:
+                    self._reset_ball_motion_state()
+                    scene_cut_cooldown -= 1
+                prev_frame = frame.copy()
                 self.tracker.mapper.side_flipped = self.side_flipped
 
                 if frame_index % self.TRACKING_INTERVAL == 0 or not has_cached_tracking:
@@ -347,6 +449,8 @@ class BadmintonAnalysisApp:
                                 and frame_index - self.last_rally_frame >= self.MIN_RALLY_FRAME_GAP
                             ):
                                 self.analyzer.close_current_rally()
+                                if self.ball_analyzer is not None:
+                                    self.ball_analyzer.reset_rally()
                                 self.visualizer.reset_rally_chart()
                                 self.prev_score = score
                                 self._update_side_flip_state(score)
@@ -368,6 +472,8 @@ class BadmintonAnalysisApp:
                     and frame_index - self.last_rally_frame >= self.FALLBACK_RALLY_FRAME_GAP
                 ):
                     self.analyzer.close_current_rally()
+                    if self.ball_analyzer is not None:
+                        self.ball_analyzer.reset_rally()
                     self.visualizer.reset_rally_chart()
                     self.last_rally_frame = frame_index
                     self.missing_frames = 0
@@ -377,6 +483,16 @@ class BadmintonAnalysisApp:
                 else:
                     final_metrics = self.analyzer.get_metrics()
                 smoothed_tracking_data = self.analyzer.get_smoothed_tracking_data()
+                if scene_cut_active:
+                    ball_state = self._scene_cut_ball_state()
+                else:
+                    ball_state = self._update_ball_state(
+                        frame,
+                        smoothed_tracking_data,
+                        frame_index,
+                        len(final_metrics.get("rally_history", [])) + 1,
+                        fps,
+                    )
                 stage_times["analysis"] += time.perf_counter() - stage_start_time
 
                 stage_start_time = time.perf_counter()
@@ -385,6 +501,8 @@ class BadmintonAnalysisApp:
                     pose_frame,
                     smoothed_tracking_data,
                     final_metrics,
+                    ball_state=ball_state,
+                    scene_cut=scene_cut_active,
                 )
                 stage_times["visualization"] += time.perf_counter() - stage_start_time
 
@@ -440,6 +558,58 @@ class BadmintonAnalysisApp:
         }
         return frame_index, final_metrics, average_frame_time_ms, average_stage_times_ms
 
+    def _reset_ball_motion_state(self):
+        if self.ball_detector is not None:
+            self.ball_detector.frame_buffer = []
+        if self.ball_tracker is not None:
+            self.ball_tracker.reset()
+        if self.ball_analyzer is not None:
+            self.ball_analyzer.reset_position()
+        self.visualizer.clear_ball_trail()
+
+    def _is_valid_ball_view(self, frame):
+        if self.ball_detector is None or self.ball_h_matrix is None:
+            return True
+        return is_valid_court_view(frame, self.ball_h_matrix)
+
+    def _scene_cut_ball_state(self):
+        if self.ball_analyzer is None:
+            return {
+                "current_speed_kmh": None,
+                "rally_max_speed": {1: 0.0, 2: 0.0},
+                "shots": [],
+                "pos": None,
+                "scene_cut": True,
+            }
+        state = self.ball_analyzer.get_state()
+        state["current_speed_kmh"] = None
+        state["pos"] = None
+        state["detection"] = None
+        state["speed_kmh"] = None
+        state["detected_frames"] = self.ball_detected_frames
+        state["scene_cut"] = True
+        return state
+
+    def _update_ball_state(self, frame, player_positions, frame_index, rally_id, fps):
+        if self.ball_detector is None or self.ball_tracker is None or self.ball_analyzer is None:
+            return None
+
+        if self.ball_analyzer.fps != fps:
+            self.ball_analyzer.fps = fps
+
+        detection = self.ball_detector.detect(frame)
+        if detection is not None:
+            self.ball_detected_frames += 1
+
+        ball_pos = self.ball_tracker.update(detection)
+        speed = self.ball_analyzer.update(ball_pos, player_positions, frame_index, rally_id)
+        state = self.ball_analyzer.get_state()
+        state["pos"] = ball_pos
+        state["detection"] = detection
+        state["speed_kmh"] = speed
+        state["detected_frames"] = self.ball_detected_frames
+        return state
+
     def _is_live_frame(self, frame):
         """Return True when the top-left scoreboard suggests this is live play."""
         roi_height = min(self.SCOREBOARD_ROI_HEIGHT, frame.shape[0])
@@ -468,7 +638,7 @@ class BadmintonAnalysisApp:
         if frame_index % self.SCORE_OCR_INTERVAL != 0:
             return None
 
-        y1, y2, x1, x2 = self.SCORE_DIGITS_ROI
+        y1, y2, x1, x2 = self.score_roi
         y2 = min(y2, frame.shape[0])
         x2 = min(x2, frame.shape[1])
         if y1 >= y2 or x1 >= x2:
@@ -520,12 +690,23 @@ class BadmintonAnalysisApp:
         height, width = output_frame.shape[:2]
         return FFmpegVideoWriter(self.output_path, fps, (width, height))
 
+    def _normalize_score_roi(self, score_roi):
+        """Return score ROI as (y1, y2, x1, x2)."""
+        if score_roi is None:
+            raise ValueError("Source config is missing score_roi.")
+        return (
+            int(score_roi["y1"]),
+            int(score_roi["y2"]),
+            int(score_roi["x1"]),
+            int(score_roi["x2"]),
+        )
+
 
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Run the full badminton analysis pipeline")
-    parser.add_argument("--video", required=True, help="Path to the input video")
-    parser.add_argument("--calibration", required=True, help="Path to H.npy calibration matrix")
+    parser.add_argument("--source", required=True, help="Configured source name")
+    parser.add_argument("--video", default=None, help="Override video path from source config")
     parser.add_argument("--output", required=True, help="Path to the output mp4 video")
     parser.add_argument("--start", type=float, default=0, help="Start time in seconds")
     parser.add_argument("--duration", type=float, default=None, help="Duration to process in seconds")
@@ -536,11 +717,18 @@ def parse_args():
 def main():
     """Process the video and print progress plus final player distances."""
     args = parse_args()
+    manager = SourceManager()
+    config = manager.load_source(args.source)
+    video_path = args.video or config["video_path"]
     app = BadmintonAnalysisApp(
-        video_path=args.video,
-        calibration_path=args.calibration,
+        video_path=video_path,
+        calibration_path=config["h_matrix_path"],
         output_path=args.output,
         start_seconds=args.start,
+        fps=config.get("fps"),
+        score_roi=config.get("score_roi"),
+        court_h_threshold=config["court_h_threshold"],
+        side_flipped=config.get("side_flipped", False),
     )
     (
         processed_frames,
@@ -557,6 +745,7 @@ def main():
     print(f"Player2 total distance: {player2:.2f}m")
     print(f"Rally count: {rally_count}")
     print(f"Side flip count: {app.side_flip_count}")
+    print(f"Ball detected frames: {app.ball_detected_frames}")
     print(f"Average frame time: {average_frame_time_ms:.2f} ms")
     for name, elapsed_ms in average_stage_times_ms.items():
         print(f"Average {name} time: {elapsed_ms:.2f} ms")

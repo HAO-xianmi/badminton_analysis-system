@@ -22,13 +22,16 @@ class Visualizer:
     """Render a left metrics panel plus the original video frame."""
 
     PANEL_WIDTH = 300
-    PANEL_HEIGHT = 900
-    COURT_HEIGHT = int(PANEL_HEIGHT * 0.7)
-    CHART_HEIGHT = PANEL_HEIGHT - COURT_HEIGHT
+    PANEL_HEIGHT = 1080
+    COURT_HEIGHT = 630
+    SPEED_PANEL_HEIGHT = 180
+    CHART_HEIGHT = PANEL_HEIGHT - COURT_HEIGHT - SPEED_PANEL_HEIGHT
     RALLY_TEXT_HEIGHT = 62
     SOURCE_WIDTH = 610
     SOURCE_HEIGHT = 1340
     HISTORY_LENGTH = 80
+    BALL_TRAIL_LENGTH = 20
+    SPEED_HISTORY_LENGTH = 50
     PANEL_RENDER_INTERVAL = 3
     TOTAL_DISTANCE_TEXT_HEIGHT = 30
     COURT_HORIZONTAL_LINES = (0, 72, 460, 670, 880, 1268, 1340)
@@ -55,14 +58,21 @@ class Visualizer:
         }
         self.total_distances = {1: 0.0, 2: 0.0}
         self.rally_history = []
+        self.ball_history = deque(maxlen=self.BALL_TRAIL_LENGTH)
+        self.ball_speed_frames = deque(maxlen=self.SPEED_HISTORY_LENGTH)
+        self.ball_speed_history = deque(maxlen=self.SPEED_HISTORY_LENGTH)
+        self.current_ball_speed = 0.0
+        self.rally_max_speed = {1: 0.0, 2: 0.0}
         self.rally_font = self._load_rally_font()
         self.court_background = self._create_court_background()
         self.cached_panel = None
         self.cached_padded_panel = None
 
-    def draw(self, frame_index, frame_bgr, tracking_data, metrics):
+    def draw(self, frame_index, frame_bgr, tracking_data, metrics, ball_state=None, scene_cut=False):
         """Return one combined BGR visualization frame."""
-        self._update_history(frame_index, tracking_data, metrics)
+        if scene_cut:
+            self.ball_history.clear()
+        self._update_history(frame_index, tracking_data, metrics, ball_state, scene_cut=scene_cut)
         if self.cached_panel is None or frame_index % self.PANEL_RENDER_INTERVAL == 0:
             court_view = self._draw_court_view()
             distance_chart = self._draw_line_chart(
@@ -73,10 +83,12 @@ class Visualizer:
                 footer_lines=self._recent_rally_lines(),
                 total_distances=self.total_distances,
             )
-            self.cached_panel = cv2.vconcat([court_view, distance_chart])
+            speed_panel = self._draw_speed_panel()
+            self.cached_panel = cv2.vconcat([court_view, distance_chart, speed_panel])
             self.cached_padded_panel = None
         panel = self._panel_for_frame_height(frame_bgr.shape[0])
-        return cv2.hconcat([panel, frame_bgr])
+        video_frame = self._draw_ball_overlay(frame_bgr.copy(), scene_cut=scene_cut)
+        return cv2.hconcat([panel, video_frame])
 
     def save_video(self, output_path):
         """Placeholder for future video export."""
@@ -95,10 +107,22 @@ class Visualizer:
             1: self.p1_dist_history,
             2: self.p2_dist_history,
         }
+        self.ball_speed_frames.clear()
+        self.ball_speed_history.clear()
+        self.ball_history.clear()
+        self.current_ball_speed = 0.0
+        self.rally_max_speed = {1: 0.0, 2: 0.0}
         self.cached_panel = None
         self.cached_padded_panel = None
 
-    def _update_history(self, frame_index, tracking_data, metrics):
+    def clear_ball_trail(self):
+        """Clear only the shuttlecock trail and live speed display."""
+        self.ball_history.clear()
+        self.current_ball_speed = None
+        self.cached_panel = None
+        self.cached_padded_panel = None
+
+    def _update_history(self, frame_index, tracking_data, metrics, ball_state=None, scene_cut=False):
         self.frames.append(frame_index)
 
         for track_id, court_point in tracking_data.items():
@@ -116,6 +140,28 @@ class Visualizer:
             self.distance_history[player_id].append(current_rally_dist.get(player_id, np.nan))
 
         self.rally_history = metrics.get("rally_history", [])
+        self._update_ball_history(frame_index, ball_state, scene_cut=scene_cut)
+
+    def _update_ball_history(self, frame_index, ball_state, scene_cut=False):
+        if scene_cut:
+            self.current_ball_speed = None
+            self.ball_speed_frames.append(frame_index)
+            self.ball_speed_history.append(np.nan)
+            return
+
+        if ball_state is None:
+            self.ball_speed_frames.append(frame_index)
+            self.ball_speed_history.append(np.nan)
+            return
+
+        self.current_ball_speed = float(ball_state.get("current_speed_kmh", 0.0) or 0.0)
+        self.rally_max_speed = ball_state.get("rally_max_speed", {1: 0.0, 2: 0.0})
+        ball_pos = ball_state.get("pos")
+        if ball_pos is not None:
+            self.ball_history.append((tuple(map(int, ball_pos)), self.current_ball_speed))
+
+        self.ball_speed_frames.append(frame_index)
+        self.ball_speed_history.append(self.current_ball_speed)
 
     def _draw_court_view(self):
         court = self.court_background.copy()
@@ -173,6 +219,148 @@ class Visualizer:
             faded_color = tuple(int(channel * alpha + 255 * (1 - alpha)) for channel in color)
             cv2.line(overlay, points[index - 1], points[index], faded_color, 2)
         cv2.addWeighted(overlay, 0.9, image, 0.1, 0, image)
+
+    def _draw_ball_overlay(self, frame, scene_cut=False):
+        if self.ball_history:
+            overlay = frame.copy()
+            history = list(self.ball_history)
+            for index in range(1, len(history)):
+                pos_a, _ = history[index - 1]
+                pos_b, speed = history[index]
+                alpha = index / max(1, len(history) - 1)
+                color = self._speed_color(speed)
+                blended = tuple(int(channel * alpha + 255 * (1 - alpha)) for channel in color)
+                cv2.line(overlay, pos_a, pos_b, blended, 3, cv2.LINE_AA)
+            cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+            current_pos, current_speed = history[-1]
+            cv2.circle(frame, current_pos, 7, self._speed_color(current_speed), -1, cv2.LINE_AA)
+            cv2.circle(frame, current_pos, 9, (255, 255, 255), 2, cv2.LINE_AA)
+
+        speed_text = "--- km/h" if scene_cut or self.current_ball_speed is None else f"{self.current_ball_speed:.0f} km/h"
+        x = max(16, frame.shape[1] - 300)
+        y = 58
+        cv2.rectangle(frame, (x - 18, y - 44), (frame.shape[1] - 20, y + 18), (0, 0, 0), -1)
+        cv2.putText(
+            frame,
+            speed_text,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.35,
+            (210, 210, 210) if scene_cut or self.current_ball_speed is None else self._speed_color(self.current_ball_speed),
+            3,
+            cv2.LINE_AA,
+        )
+        return frame
+
+    def _speed_color(self, speed_kmh):
+        if speed_kmh < 100:
+            return (255, 0, 0)
+        if speed_kmh <= 200:
+            return (0, 255, 255)
+        return (0, 0, 255)
+
+    def _draw_speed_panel(self):
+        panel = np.full((self.SPEED_PANEL_HEIGHT, self.PANEL_WIDTH, 3), 246, dtype=np.uint8)
+        self._draw_text(panel, "球速", (10, 8), 22, self.TEXT_COLOR)
+        self._draw_text(
+            panel,
+            f"本分P1最快: {self.rally_max_speed.get(1, 0.0):.1f} km/h",
+            (10, 36),
+            17,
+            self.TEXT_COLOR,
+        )
+        self._draw_text(
+            panel,
+            f"本分P2最快: {self.rally_max_speed.get(2, 0.0):.1f} km/h",
+            (10, 60),
+            17,
+            self.TEXT_COLOR,
+        )
+
+        left = 36
+        right = self.PANEL_WIDTH - 12
+        top = 92
+        bottom = self.SPEED_PANEL_HEIGHT - 18
+        cv2.rectangle(panel, (left, top), (right, bottom), (180, 180, 180), 1)
+        for fraction in (0.0, 0.5, 1.0):
+            y = int(round(bottom - fraction * (bottom - top)))
+            cv2.line(panel, (left, y), (right, y), self.GRID_COLOR, 1)
+            value = int(round(fraction * self._speed_chart_max()))
+            cv2.putText(
+                panel,
+                str(value),
+                (4, y + 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                self.TEXT_COLOR,
+                1,
+                cv2.LINE_AA,
+            )
+
+        points = self._speed_chart_points(left, right, top, bottom)
+        if len(points) >= 2:
+            cv2.polylines(panel, [np.array(points, dtype=np.int32)], False, (30, 30, 30), 2, cv2.LINE_AA)
+        elif len(points) == 1:
+            cv2.circle(panel, points[0], 2, (30, 30, 30), -1)
+        return panel
+
+    def _draw_text(self, image, text, origin, size, color):
+        if Image is None or ImageDraw is None:
+            cv2.putText(
+                image,
+                text,
+                origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                size / 30.0,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            return
+
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb_image)
+        draw = ImageDraw.Draw(pil_image)
+        draw.text(origin, text, font=self._load_font(size), fill=color[::-1])
+        image[:] = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+    def _load_font(self, size):
+        if ImageFont is None:
+            return None
+
+        font_paths = [
+            Path(r"C:\Windows\Fonts\NotoSansSC-VF.ttf"),
+            Path(r"C:\Windows\Fonts\msyh.ttc"),
+            Path(r"C:\Windows\Fonts\simhei.ttf"),
+            Path(r"C:\Windows\Fonts\ARIALUNI.ttf"),
+        ]
+        for font_path in font_paths:
+            if font_path.exists():
+                return ImageFont.truetype(str(font_path), size)
+        return ImageFont.load_default()
+
+    def _speed_chart_points(self, left, right, top, bottom):
+        frames = list(self.ball_speed_frames)
+        values = list(self.ball_speed_history)
+        if not frames or not values:
+            return []
+
+        frame_min = frames[0]
+        frame_max = max(frames[-1], frame_min + 1)
+        value_max = self._speed_chart_max()
+        points = []
+        for frame_index, value in zip(frames, values):
+            if value is None or np.isnan(value):
+                continue
+            x = left + int(round((frame_index - frame_min) / (frame_max - frame_min) * (right - left)))
+            normalized = min(max(float(value) / value_max, 0.0), 1.0)
+            y = bottom - int(round(normalized * (bottom - top)))
+            points.append((x, y))
+        return points
+
+    def _speed_chart_max(self):
+        values = [float(v) for v in self.ball_speed_history if v is not None and not np.isnan(v)]
+        return max(250.0, max(values, default=0.0) * 1.15)
 
     def _draw_line_chart(
         self,

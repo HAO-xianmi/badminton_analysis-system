@@ -1,0 +1,45 @@
+{
+  "source_name": "allengland_2019",
+  "video_path": "F:\\Fun-Activities\\badminton_analysis\\data\\raw\\35083126107-1-30116.mp4",
+  "fps": 50.0,
+  "resolution": [
+    1920,
+    1080
+  ],
+  "total_frames": 60463,
+  "h_matrix_path": "F:\\Fun-Activities\\badminton_analysis\\data\\calibration\\allengland_2019_H.npy",
+  "score_roi": {
+    "y1": 50,
+    "y2": 135,
+    "x1": 630,
+    "x2": 705,
+    "calibrated": true
+  },
+  "court_h_threshold": 670,
+  "side_flipped": false,
+  "ball_detection": {
+    "enabled": false,
+    "model_path": "",
+    "min_confidence": 0.5,
+    "max_speed_kmh": 500,
+    "trail_frames": 8
+  },
+  "players": {
+    "player1": {
+      "name": "Player 1",
+      "color": [
+        0,
+        255,
+        0
+      ]
+    },
+    "player2": {
+      "name": "Player 2",
+      "color": [
+        255,
+        0,
+        0
+      ]
+    }
+  }
+}

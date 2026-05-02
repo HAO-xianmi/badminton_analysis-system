@@ -14,9 +14,10 @@ class Calibrator:
     OUTPUT_PATH = Path(r"F:\Fun-Activities\badminton_analysis\data\calibration\H.npy")
     VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv"}
 
-    def __init__(self, video_path, start_seconds=0):
+    def __init__(self, video_path, start_seconds=0, output_path=None):
         self.video_path = Path(video_path)
         self.start_seconds = start_seconds
+        self.output_path = Path(output_path) if output_path is not None else self.OUTPUT_PATH
         self.frame = None
         self.display_frame = None
         self.clicked_points = []
@@ -62,6 +63,7 @@ class Calibrator:
 
     def on_mouse_click(self, event, x, y, flags, param):
         """Handle left-click events and collect up to four points."""
+        _ = flags, param
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
@@ -69,7 +71,7 @@ class Calibrator:
             return
 
         self.clicked_points.append((x, y))
-        print(f"点{len(self.clicked_points)}: ({x}, {y})", flush=True)
+        print(f"Point {len(self.clicked_points)}: ({x}, {y})", flush=True)
         self.draw_point(x, y)
         cv2.imshow(self.WINDOW_NAME, self.display_frame)
 
@@ -85,14 +87,14 @@ class Calibrator:
 
     def save_results(self, h_matrix):
         """Save the homography matrix to disk."""
-        self.OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        np.save(self.OUTPUT_PATH, h_matrix)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(self.output_path, h_matrix)
 
     def run(self):
         """Run the interactive calibration workflow."""
         if not self.load_frame():
-            print("未找到可用视频帧，请检查视频路径或起始秒数。")
-            return
+            print("Cannot read a usable video frame. Check the video path and start time.")
+            return None
 
         cv2.namedWindow(self.WINDOW_NAME)
         cv2.setMouseCallback(self.WINDOW_NAME, self.on_mouse_click)
@@ -106,9 +108,12 @@ class Calibrator:
         if len(self.clicked_points) == 4:
             h_matrix = self.compute_homography()
             self.save_results(h_matrix)
-            print("标定完成，H矩阵已保存")
+            print(f"Calibration complete. H matrix saved to: {self.output_path}")
+            cv2.destroyAllWindows()
+            return h_matrix
 
         cv2.destroyAllWindows()
+        return None
 
 
 def parse_args():
@@ -116,13 +121,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Badminton court calibration tool")
     parser.add_argument("--video", required=True, help="Path to a video file or folder")
     parser.add_argument("--start", type=float, default=0, help="Start time in seconds")
+    parser.add_argument("--output", default=None, help="Path to save H.npy calibration matrix")
     return parser.parse_args()
 
 
 def main():
     """Program entry point."""
     args = parse_args()
-    calibrator = Calibrator(args.video, start_seconds=args.start)
+    calibrator = Calibrator(args.video, start_seconds=args.start, output_path=args.output)
     calibrator.run()
 
 
