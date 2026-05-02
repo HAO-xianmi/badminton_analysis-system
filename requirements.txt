@@ -1,6 +1,10 @@
-ultralytics
-opencv-python
-mediapipe
-matplotlib
-numpy
-ffmpeg-python
+easyocr>=1.7
+ffmpeg-python>=0.2
+mediapipe>=0.10
+numpy>=1.26
+opencv-python>=4.9
+Pillow>=10.0
+pytest>=8.0
+python-dotenv>=1.0
+torch>=2.2
+ultralytics>=8.2

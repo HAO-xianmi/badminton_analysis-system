@@ -6,22 +6,24 @@ from pathlib import Path
 
 import cv2
 
+from paths import CALIBRATION_DIR, ROOT_DIR, as_project_relative, ensure_runtime_dirs, resolve_path
 
-CONFIG_DIR = Path("F:/Fun-Activities/badminton_analysis/data/calibration")
+CONFIG_DIR = CALIBRATION_DIR
 
 
 class SourceManager:
     """Create, load, update, and list per-source analysis configuration files."""
 
     def __init__(self):
+        ensure_runtime_dirs()
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self.config_path = None
         self.config = {}
 
     def create_source(self, video_path, source_name):
         """Create a config for a new source."""
-        video_path = os.fspath(video_path)
-        cap = cv2.VideoCapture(video_path)
+        video_path = resolve_path(video_path)
+        cap = cv2.VideoCapture(os.fspath(video_path))
         if not cap.isOpened():
             cap.release()
             raise RuntimeError(f"Cannot open video: {video_path}")
@@ -34,11 +36,11 @@ class SourceManager:
 
         self.config = {
             "source_name": source_name,
-            "video_path": video_path,
+            "video_path": as_project_relative(video_path),
             "fps": fps,
             "resolution": [width, height],
             "total_frames": total_frames,
-            "h_matrix_path": str(CONFIG_DIR / f"{source_name}_H.npy"),
+            "h_matrix_path": as_project_relative(CONFIG_DIR / f"{source_name}_H.npy"),
             "score_roi": {
                 "y1": 50,
                 "y2": 135,
@@ -75,6 +77,9 @@ class SourceManager:
             raise FileNotFoundError(f"Source config not found: {source_name}")
         with open(config_file, "r", encoding="utf-8") as f:
             self.config = json.load(f)
+        for key in ("video_path", "h_matrix_path"):
+            if key in self.config:
+                self.config[key] = str(resolve_path(self.config[key], ROOT_DIR))
         self.config_path = config_file
         return self.config
 
@@ -96,7 +101,7 @@ class SourceManager:
         for config_path in configs:
             with open(config_path, encoding="utf-8") as f:
                 cfg = json.load(f)
-            h_exists = Path(cfg["h_matrix_path"]).exists()
+            h_exists = resolve_path(cfg["h_matrix_path"], ROOT_DIR).exists()
             score_roi = cfg.get("score_roi", {})
             sources.append(
                 {

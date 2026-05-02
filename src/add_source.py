@@ -25,8 +25,8 @@ class ScoreRoiCalibrator:
     def run(self):
         """Loop until the selected ROI can be read as two score numbers."""
         frame = self._load_frame()
-        print("请用鼠标框选记分牌数字区域。")
-        print("按 Enter/Space 确认，按 Esc 取消。")
+        print("Use the mouse to select the scoreboard digit area.")
+        print("Press Enter/Space to confirm, or Esc to cancel.")
 
         while True:
             roi = cv2.selectROI(self.WINDOW_NAME, frame, showCrosshair=True, fromCenter=False)
@@ -38,22 +38,22 @@ class ScoreRoiCalibrator:
 
             score = self.read_score(frame, y, y + h, x, x + w)
             if score is not None:
-                print(f"✓ 识别成功：{score[0]} - {score[1]}")
+                print(f"OCR succeeded: {score[0]} - {score[1]}")
                 return y, y + h, x, x + w
 
-            print("未能识别出两个数字，请重新框选。")
+            print("Could not read two score digits. Please select the ROI again.")
 
     def _load_frame(self):
         capture = cv2.VideoCapture(str(self.video_path))
         if not capture.isOpened():
             capture.release()
-            raise RuntimeError(f"无法打开视频：{self.video_path}")
+            raise RuntimeError(f"Cannot open video: {self.video_path}")
 
         capture.set(cv2.CAP_PROP_POS_MSEC, self.frame_seconds * 1000)
         success, frame = capture.read()
         capture.release()
         if not success or frame is None:
-            raise RuntimeError(f"无法读取 {self.frame_seconds} 秒处的视频帧。")
+            raise RuntimeError(f"Cannot read a frame at {self.frame_seconds} seconds.")
         return frame
 
     def read_score(self, frame, y1, y2, x1, x2):
@@ -106,65 +106,68 @@ def prompt_float(message, default=None):
         try:
             return float(value)
         except (TypeError, ValueError):
-            print("请输入数字。")
+            print("Please enter a number.")
 
 
 def print_sources(sources):
     """Print configured sources in a compact table."""
     if not sources:
-        print("还没有已配置的片源。")
+        print("No video sources have been configured yet.")
         return
 
-    print("已配置片源：")
+    print("Configured sources:")
     for source in sources:
-        h_status = "已标定" if source["calibrated"] else "未标定"
-        roi_status = "ROI已校准" if source["score_roi_calibrated"] else "ROI未校准"
+        h_status = "calibrated" if source["calibrated"] else "not calibrated"
+        roi_status = "ROI calibrated" if source["score_roi_calibrated"] else "ROI not calibrated"
         print(f"- {source['name']} | {h_status} | {roi_status} | {source['video']}")
 
 
 def validate_source_name(source_name):
     """Keep source names safe for config and H-matrix filenames."""
     if not source_name:
-        raise ValueError("片源名称不能为空。")
+        raise ValueError("Source name cannot be empty.")
     if any(char in source_name for char in '\\/:*?"<>|'):
-        raise ValueError('片源名称不能包含：\\ / : * ? " < > |')
+        raise ValueError('Source name cannot contain: \\ / : * ? " < > |')
 
 
 def add_source_interactive():
     """Guide the user through creating and calibrating a source."""
     manager = SourceManager()
 
-    source_name = prompt_text("请输入片源名称（如 match_2026_uberCup）")
+    source_name = prompt_text("Source name, for example match_2026_uber_cup")
     validate_source_name(source_name)
-    video_path = prompt_text("请输入视频完整路径")
-    if not Path(video_path).exists():
-        raise FileNotFoundError(f"视频不存在：{video_path}")
+    video_path = prompt_text("Full path to the input video")
+    if not Path(video_path).expanduser().exists():
+        raise FileNotFoundError(f"Video does not exist: {video_path}")
 
     config = manager.create_source(video_path, source_name)
     width, height = config["resolution"]
     print(
-        f"视频信息：{width}x{height} | "
+        f"Video: {width}x{height} | "
         f"{config['fps']:.2f} fps | {config['total_frames']} frames"
     )
 
-    calibration_seconds = prompt_float("请输入标定开始时间（秒，找到有完整球场的帧）", 0)
-    print("请依次点击球场四个角点：左上、右上、右下、左下。")
+    calibration_seconds = prompt_float(
+        "Calibration timestamp in seconds, using a frame with the full court visible",
+        0,
+    )
+    print("Click court corners in order: top-left, top-right, bottom-right, bottom-left.")
     h_matrix = Calibrator(
         video_path,
         start_seconds=calibration_seconds,
         output_path=config["h_matrix_path"],
     ).run()
     if h_matrix is None:
-        raise RuntimeError("标定未完成。")
+        raise RuntimeError("Court calibration was not completed.")
 
-    score_seconds = prompt_float("请找到有记分牌的帧时间（秒）", calibration_seconds)
+    score_seconds = prompt_float("Scoreboard ROI timestamp in seconds", calibration_seconds)
     selected_roi = ScoreRoiCalibrator(video_path, score_seconds).run()
     if selected_roi is None:
-        raise RuntimeError("记分牌ROI校准未完成。")
+        raise RuntimeError("Scoreboard ROI calibration was not completed.")
 
     y1, y2, x1, x2 = selected_roi
     manager.save_score_roi(y1, y2, x1, x2)
-    print(f"配置已保存：{manager.config_path}")
+    print(f"Configuration saved: {manager.config_path}")
 
 
 def parse_args():

@@ -8,6 +8,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+from paths import tracker_config_path, yolo_model_path
+
 
 class PlayerIDMapper:
     """Map raw tracks to player ids by fixed court half."""
@@ -39,7 +41,7 @@ class PlayerIDMapper:
 class Tracker:
     """Track people and return valid player positions in court coordinates."""
 
-    TRACKER_CONFIG = Path(r"F:\Fun-Activities\badminton_analysis\data\logs\bytetrack.yaml")
+    TRACKER_CONFIG = tracker_config_path()
     YOLO_IMAGE_SIZE = 416
 
     def __init__(
@@ -50,7 +52,7 @@ class Tracker:
         court_h_threshold=670,
     ):
         self.h_matrix = np.load(calibration_path)
-        self.model = YOLO(model_name)
+        self.model = YOLO(yolo_model_path(model_name))
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
         self.use_half = self.device == "cuda"

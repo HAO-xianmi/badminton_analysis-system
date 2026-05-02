@@ -31,6 +31,8 @@ class Visualizer:
     SOURCE_HEIGHT = 1340
     HISTORY_LENGTH = 80
     BALL_TRAIL_LENGTH = 20
+    PLAYER_TRAIL_SECONDS = 2
+    PLAYER_TRAIL_FALLBACK_FPS = 30.0
     SPEED_HISTORY_LENGTH = 50
     PANEL_RENDER_INTERVAL = 3
     TOTAL_DISTANCE_TEXT_HEIGHT = 30
@@ -58,6 +60,8 @@ class Visualizer:
         }
         self.total_distances = {1: 0.0, 2: 0.0}
         self.rally_history = []
+        self.player_trail_frame_count = int(self.PLAYER_TRAIL_FALLBACK_FPS * self.PLAYER_TRAIL_SECONDS)
+        self.player_trails = defaultdict(lambda: deque(maxlen=self.player_trail_frame_count))
         self.ball_history = deque(maxlen=self.BALL_TRAIL_LENGTH)
         self.ball_speed_frames = deque(maxlen=self.SPEED_HISTORY_LENGTH)
         self.ball_speed_history = deque(maxlen=self.SPEED_HISTORY_LENGTH)
@@ -68,10 +72,11 @@ class Visualizer:
         self.cached_panel = None
         self.cached_padded_panel = None
 
-    def draw(self, frame_index, frame_bgr, tracking_data, metrics, ball_state=None, scene_cut=False):
+    def draw(self, frame_index, frame_bgr, tracking_data, metrics, ball_state=None, scene_cut=False, H=None, fps=None):
         """Return one combined BGR visualization frame."""
         if scene_cut:
             self.ball_history.clear()
+        self._configure_player_trail_length(fps)
         self._update_history(frame_index, tracking_data, metrics, ball_state, scene_cut=scene_cut)
         if self.cached_panel is None or frame_index % self.PANEL_RENDER_INTERVAL == 0:
             court_view = self._draw_court_view()
@@ -87,7 +92,15 @@ class Visualizer:
             self.cached_panel = cv2.vconcat([court_view, distance_chart, speed_panel])
             self.cached_padded_panel = None
         panel = self._panel_for_frame_height(frame_bgr.shape[0])
-        video_frame = self._draw_ball_overlay(frame_bgr.copy(), scene_cut=scene_cut)
+        video_frame = frame_bgr.copy()
+        if H is not None:
+            video_frame = self.draw_player_trails_on_frame(
+                video_frame,
+                self.player_trails,
+                H,
+                fps or self.PLAYER_TRAIL_FALLBACK_FPS,
+            )
+        video_frame = self._draw_ball_overlay(video_frame, scene_cut=scene_cut)
         return cv2.hconcat([panel, video_frame])
 
     def save_video(self, output_path):
@@ -124,9 +137,13 @@ class Visualizer:
 
     def _update_history(self, frame_index, tracking_data, metrics, ball_state=None, scene_cut=False):
         self.frames.append(frame_index)
+        if scene_cut:
+            self.player_trails.clear()
 
         for track_id, court_point in tracking_data.items():
             self.position_history[track_id].append(court_point)
+            if not scene_cut:
+                self.player_trails[track_id].append(court_point)
             cell = self._court_cell(court_point)
             if cell is not None:
                 self.stay_counts[(track_id, cell[0], cell[1])] += 1
@@ -141,6 +158,51 @@ class Visualizer:
 
         self.rally_history = metrics.get("rally_history", [])
         self._update_ball_history(frame_index, ball_state, scene_cut=scene_cut)
+
+    def _configure_player_trail_length(self, fps):
+        fps_value = self.PLAYER_TRAIL_FALLBACK_FPS
+        if fps:
+            fps_value = float(fps)
+        trail_frame_count = max(2, int(fps_value * self.PLAYER_TRAIL_SECONDS))
+        if trail_frame_count == self.player_trail_frame_count:
+            return
+
+        previous_trails = self.player_trails
+        self.player_trail_frame_count = trail_frame_count
+        self.player_trails = defaultdict(lambda: deque(maxlen=self.player_trail_frame_count))
+        for player_id, trail in previous_trails.items():
+            self.player_trails[player_id].extend(list(trail)[-trail_frame_count:])
+
+    def draw_player_trails_on_frame(self, frame, trail_dict, H, fps):
+        H_inv = np.linalg.inv(H)
+        trail_frames = int(fps * self.PLAYER_TRAIL_SECONDS)
+
+        colors = {1: (0, 255, 0), 2: (255, 100, 0)}
+
+        for player_id, trail in trail_dict.items():
+            if len(trail) < 2:
+                continue
+
+            recent = list(trail)[-trail_frames:]
+            color = colors.get(player_id, (255, 255, 255))
+
+            pts = []
+            for court_pos in recent:
+                p = np.float32([[court_pos]])
+                img_pos = cv2.perspectiveTransform(p, H_inv)[0][0]
+                pts.append((int(img_pos[0]), int(img_pos[1])))
+
+            for i in range(1, len(pts)):
+                alpha = i / len(pts)
+                c = tuple(int(ch * alpha) for ch in color)
+                thickness = max(1, int(alpha * 4))
+                cv2.line(frame, pts[i - 1], pts[i], c, thickness, cv2.LINE_AA)
+
+            if pts:
+                cv2.circle(frame, pts[-1], 8, color, -1, cv2.LINE_AA)
+                cv2.circle(frame, pts[-1], 8, (255, 255, 255), 1, cv2.LINE_AA)
+
+        return frame
 
     def _update_ball_history(self, frame_index, ball_state, scene_cut=False):
         if scene_cut:

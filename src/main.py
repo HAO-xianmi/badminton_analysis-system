@@ -1,6 +1,7 @@
 """End-to-end badminton analysis pipeline for video processing and export."""
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ from ball_analyzer import BallAnalyzer
 from ball_detector import BallDetector
 from ball_tracker import BallTracker
 from detector import Detector
+from paths import ball_speed_csv_path, tracknet_weights_path
 from source_manager import SourceManager
 from tracker import Tracker
 from visualizer import Visualizer
@@ -100,12 +102,41 @@ def find_ffmpeg_executable():
     raise RuntimeError("ffmpeg executable not found. Install it with: winget install --id Gyan.FFmpeg -e")
 
 
+def has_ffmpeg_encoder(ffmpeg_path, encoder):
+    """Return True when the local ffmpeg build advertises an encoder."""
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return encoder in result.stdout
+
+
+def preferred_h264_encoder(ffmpeg_path):
+    """Choose a portable H.264 encoder, using NVENC only when it is likely usable."""
+    forced_codec = os.environ.get("BADMINTON_FFMPEG_CODEC")
+    if forced_codec:
+        return forced_codec
+
+    if torch.cuda.is_available() and has_ffmpeg_encoder(ffmpeg_path, "h264_nvenc"):
+        return "h264_nvenc"
+    return "libx264"
+
+
 def create_writer(output_path, fps, width, height):
-    """Create an ffmpeg NVENC process that accepts raw BGR frames on stdin."""
+    """Create an ffmpeg process that accepts raw BGR frames on stdin."""
     width = width if width % 2 == 0 else width + 1
     height = height if height % 2 == 0 else height + 1
+    ffmpeg_path = find_ffmpeg_executable()
+    codec = preferred_h264_encoder(ffmpeg_path)
+    preset = "fast" if codec == "h264_nvenc" else "veryfast"
     cmd = [
-        find_ffmpeg_executable(),
+        ffmpeg_path,
         "-y",
         "-f",
         "rawvideo",
@@ -120,9 +151,9 @@ def create_writer(output_path, fps, width, height):
         "-i",
         "pipe:0",
         "-vcodec",
-        "h264_nvenc",
+        codec,
         "-preset",
-        "fast",
+        preset,
         "-pix_fmt",
         "yuv420p",
         "-movflags",
@@ -246,6 +277,7 @@ class BadmintonAnalysisApp:
         score_roi=None,
         court_h_threshold=None,
         side_flipped=False,
+        ball_detection_config=None,
     ):
         self.video_path = Path(video_path)
         self.calibration_path = Path(calibration_path)
@@ -256,12 +288,14 @@ class BadmintonAnalysisApp:
         if court_h_threshold is None:
             raise ValueError("Source config is missing court_h_threshold.")
         self.court_h_threshold = court_h_threshold
+        self.ball_detection_config = ball_detection_config or {}
 
         self.detector = Detector()
         self.tracker = Tracker(
             str(self.calibration_path),
             court_h_threshold=self.court_h_threshold,
         )
+        self.h_matrix = self.tracker.h_matrix
         self.analyzer = Analyzer()
         self.visualizer = Visualizer()
         self.ball_detector = None
@@ -283,7 +317,11 @@ class BadmintonAnalysisApp:
 
     def _init_ball_pipeline(self):
         """Initialize shuttlecock speed analysis when TrackNet weights exist."""
-        weights_path = Path(__file__).resolve().parent / "tracknet_weights.pt"
+        if self.ball_detection_config and not self.ball_detection_config.get("enabled", True):
+            print("Ball speed disabled: source config ball_detection.enabled is false")
+            return
+
+        weights_path = tracknet_weights_path(required=False)
         if not weights_path.exists():
             print(f"Ball speed disabled: TrackNetV2 weights not found at {weights_path}")
             return
@@ -293,12 +331,13 @@ class BadmintonAnalysisApp:
             self.ball_detector = BallDetector(
                 weights_path,
                 device="cuda" if torch.cuda.is_available() else "cpu",
+                min_confidence=self.ball_detection_config.get("min_confidence", 0.5),
             )
             self.ball_tracker = BallTracker()
             self.ball_analyzer = BallAnalyzer(
                 h_matrix,
                 fps=self.config_fps or 50.0,
-                csv_path=Path("F:/Fun-Activities/badminton_analysis/data/logs/ball_speeds.csv"),
+                csv_path=ball_speed_csv_path(),
             )
             self.ball_h_matrix = h_matrix
             print(f"Ball speed enabled: {weights_path}")
@@ -503,6 +542,8 @@ class BadmintonAnalysisApp:
                     final_metrics,
                     ball_state=ball_state,
                     scene_cut=scene_cut_active,
+                    H=self.h_matrix,
+                    fps=fps,
                 )
                 stage_times["visualization"] += time.perf_counter() - stage_start_time
 
@@ -729,6 +770,7 @@ def main():
         score_roi=config.get("score_roi"),
         court_h_threshold=config["court_h_threshold"],
         side_flipped=config.get("side_flipped", False),
+        ball_detection_config=config.get("ball_detection"),
     )
     (
         processed_frames,

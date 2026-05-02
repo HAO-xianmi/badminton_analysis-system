@@ -1,4 +1,4 @@
-"""YOLOv8 person detector for badminton video frames."""
+"""YOLOv8 person detector and MediaPipe pose renderer for badminton frames."""
 
 import argparse
 from pathlib import Path
@@ -6,18 +6,20 @@ from pathlib import Path
 import cv2
 import mediapipe as mp
 import torch
-from ultralytics import YOLO
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
+from ultralytics import YOLO
+
+from paths import pose_model_path, yolo_model_path
 
 
 class Detector:
-    """Detect people in a frame and return bounding boxes with foot points."""
+    """Detect people in a frame and draw pose skeletons for tracked players."""
 
     POSE_IMAGE_WIDTH = 640
 
     def __init__(self, model_name="yolov8s.pt", confidence_threshold=0.5):
-        self.model_name = model_name
+        self.model_name = yolo_model_path(model_name)
         self.confidence_threshold = confidence_threshold
         self.model = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -25,9 +27,14 @@ class Detector:
         self.cached_pose_points_by_track_id = {}
         self.cached_pose_landmarks_by_track_id = {}
         self.cached_head_y_by_track_id = {}
+        self.pose_model_path = pose_model_path(required=True)
         self.pose_delegate = "GPU"
+        self.pose_detector = self._create_pose_detector()
+
+    def _create_pose_detector(self):
+        """Create a MediaPipe pose landmarker, falling back to CPU when needed."""
         base_options = mp_python.BaseOptions(
-            model_asset_path="F:/Fun-Activities/badminton_analysis/pose_landmarker.task",
+            model_asset_path=str(self.pose_model_path),
             delegate=mp_python.BaseOptions.Delegate.GPU,
         )
         options = mp_vision.PoseLandmarkerOptions(
@@ -35,18 +42,16 @@ class Detector:
             num_poses=2,
         )
         try:
-            self.pose_detector = mp_vision.PoseLandmarker.create_from_options(options)
+            return mp_vision.PoseLandmarker.create_from_options(options)
         except NotImplementedError as error:
             self.pose_delegate = "CPU"
             print(f"MediaPipe GPU delegate unavailable, falling back to CPU: {error}")
-            base_options = mp_python.BaseOptions(
-                model_asset_path="F:/Fun-Activities/badminton_analysis/pose_landmarker.task"
-            )
+            base_options = mp_python.BaseOptions(model_asset_path=str(self.pose_model_path))
             options = mp_vision.PoseLandmarkerOptions(
                 base_options=base_options,
                 num_poses=2,
             )
-            self.pose_detector = mp_vision.PoseLandmarker.create_from_options(options)
+            return mp_vision.PoseLandmarker.create_from_options(options)
 
     def load_model(self):
         """Load the YOLO model."""
@@ -113,8 +118,8 @@ class Detector:
             ) = self._detect_frame_pose_points(frame, tracked_bboxes)
 
         for track_id, bbox in tracked_bboxes.items():
+            _ = bbox
             color = colors.get(track_id, (0, 255, 255))
-
             cached_points = self.cached_pose_points_by_track_id.get(track_id)
             if cached_points:
                 self._draw_pose_points(frame, cached_points, connections, color)
@@ -242,9 +247,9 @@ def main():
     detector = Detector()
     detections = detector.detect(frame)
 
-    print(f"检测到 {len(detections)} 个人")
+    print(f"Detected {len(detections)} people")
     for index, detection in enumerate(detections, start=1):
-        print(f"人{index} foot_point: {detection['foot_point']}")
+        print(f"Person {index} foot_point: {detection['foot_point']}")
 
 
 if __name__ == "__main__":

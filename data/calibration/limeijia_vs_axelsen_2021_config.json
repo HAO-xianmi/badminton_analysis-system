@@ -1,21 +1,21 @@
 {
-  "source_name": "allengland_2019",
-  "video_path": "data/raw/35083126107-1-30116.mp4",
-  "fps": 50.0,
+  "source_name": "limeijia_vs_axelsen_2021",
+  "video_path": "data/raw/limeijia_vs_axelsen_2021.mp4",
+  "fps": 59.999964468469024,
   "resolution": [
     1920,
     1080
   ],
-  "total_frames": 60463,
-  "h_matrix_path": "data/calibration/allengland_2019_H.npy",
+  "total_frames": 63324,
+  "h_matrix_path": "data/calibration/limeijia_vs_axelsen_2021_H.npy",
   "score_roi": {
-    "y1": 50,
-    "y2": 135,
-    "x1": 630,
-    "x2": 705,
+    "y1": 62,
+    "y2": 128,
+    "x1": 613,
+    "x2": 658,
     "calibrated": true
   },
-  "court_h_threshold": 670,
+  "court_h_threshold": 650,
   "side_flipped": false,
   "ball_detection": {
     "enabled": false,

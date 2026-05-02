@@ -6,15 +6,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from paths import CALIBRATION_DIR, ensure_runtime_dirs
+
 
 class Calibrator:
     """Collect four court points from a chosen video timestamp and save homography."""
 
     WINDOW_NAME = "Calibration"
-    OUTPUT_PATH = Path(r"F:\Fun-Activities\badminton_analysis\data\calibration\H.npy")
+    OUTPUT_PATH = CALIBRATION_DIR / "H.npy"
     VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv"}
 
     def __init__(self, video_path, start_seconds=0, output_path=None):
+        ensure_runtime_dirs()
         self.video_path = Path(video_path)
         self.start_seconds = start_seconds
         self.output_path = Path(output_path) if output_path is not None else self.OUTPUT_PATH

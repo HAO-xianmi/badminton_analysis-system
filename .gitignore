@@ -3,18 +3,26 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.env
 
 # Local data and generated outputs
 data/raw/*
 !data/raw/.gitkeep
 data/output/*
 !data/output/.gitkeep
+data/logs/*.jpg
+data/logs/*.jpeg
+data/logs/*.png
+data/logs/*.csv
 data/logs/*.log
+data/logs/*.generated.yaml
 
 # Local models and task assets
 *.pt
 *.task
 *.npy
+models/*
+!models/.gitkeep
 
 # OS/editor clutter
 .DS_Store
