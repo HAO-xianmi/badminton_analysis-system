@@ -352,13 +352,17 @@ class BadmintonAnalysisApp:
         """Process the video, save visualization output, and return final metrics."""
         capture = open_video_at_start(self.video_path, self.start_seconds)
         fps = self.config_fps or capture.get(cv2.CAP_PROP_FPS) or 30.0
+        source_total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if duration_seconds is not None:
             duration_frames = max(0, int(round(duration_seconds * fps)))
             max_frames = duration_frames if max_frames is None else min(max_frames, duration_frames)
+        total_frames = max_frames or source_total_frames
         writer = None
         frame_index = 0
         final_metrics = {}
         total_processing_time = 0.0
+        run_start_time = time.perf_counter()
+        last_progress_time = run_start_time
         stage_times = {
             "tracking": 0.0,
             "analysis": 0.0,
@@ -569,15 +573,31 @@ class BadmintonAnalysisApp:
 
                 self.tracker.mapper.side_flipped = self.side_flipped
 
-                if (frame_index + 1) % 1000 == 0:
+                current_time = time.perf_counter()
+                should_print_progress = (
+                    current_time - last_progress_time >= 300.0
+                    or (total_frames and frame_index + 1 >= total_frames)
+                )
+                if should_print_progress:
                     player1 = final_metrics.get(1, {}).get("distance_m", 0.0)
                     player2 = final_metrics.get(2, {}).get("distance_m", 0.0)
                     average_frame_time_ms = total_processing_time / (frame_index + 1) * 1000.0
-                    print(
-                        f"Frame {frame_index + 1} | "
-                        f"P1: {player1:.2f}m P2: {player2:.2f}m | "
-                        f"avg: {average_frame_time_ms:.2f}ms"
+                    progress_percent = (
+                        (frame_index + 1) / total_frames * 100.0
+                        if total_frames
+                        else 0.0
                     )
+                    remaining_frames = max(total_frames - frame_index - 1, 0) if total_frames else 0
+                    eta_minutes = remaining_frames * average_frame_time_ms / 1000.0 / 60.0
+                    print(
+                        f"Frame {frame_index + 1}/{total_frames or '?'} | "
+                        f"进度{progress_percent:.1f}% | "
+                        f"P1: {player1:.2f}m P2: {player2:.2f}m | "
+                        f"avg:{average_frame_time_ms:.2f}ms | "
+                        f"预计剩余:{eta_minutes:.1f}分钟",
+                        flush=True,
+                    )
+                    last_progress_time = current_time
 
                 frame_index += 1
         finally:
@@ -597,7 +617,14 @@ class BadmintonAnalysisApp:
             name: (elapsed / frame_index * 1000.0) if frame_index else 0.0
             for name, elapsed in stage_times.items()
         }
-        return frame_index, final_metrics, average_frame_time_ms, average_stage_times_ms
+        total_elapsed_minutes = (time.perf_counter() - run_start_time) / 60.0
+        return (
+            frame_index,
+            final_metrics,
+            average_frame_time_ms,
+            average_stage_times_ms,
+            total_elapsed_minutes,
+        )
 
     def _reset_ball_motion_state(self):
         if self.ball_detector is not None:
@@ -777,11 +804,23 @@ def main():
         final_metrics,
         average_frame_time_ms,
         average_stage_times_ms,
+        total_elapsed_minutes,
     ) = app.run(max_frames=args.max_frames, duration_seconds=args.duration)
 
     player1 = final_metrics.get(1, {}).get("distance_m", 0.0)
     player2 = final_metrics.get(2, {}).get("distance_m", 0.0)
     rally_count = len(final_metrics.get("rally_history", []))
+    completion_titles = {
+        "momota_vs_ishiyuki_2018": "第一个视频完成",
+        "limeijia_vs_axelsen_2021": "第二个视频完成",
+    }
+    title = completion_titles.get(args.source, "视频完成")
+    print(f"=== {title} ===")
+    print(f"总帧数：{processed_frames}")
+    print(f"P1总距离：{player1:.2f}m")
+    print(f"P2总距离：{player2:.2f}m")
+    print(f"Rally数量：{rally_count}")
+    print(f"总耗时：{total_elapsed_minutes:.2f}分钟")
     print(f"Finished processing {processed_frames} frames")
     print(f"Player1 total distance: {player1:.2f}m")
     print(f"Player2 total distance: {player2:.2f}m")

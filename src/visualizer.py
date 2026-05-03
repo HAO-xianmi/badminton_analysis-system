@@ -19,14 +19,16 @@ except ImportError:
 
 
 class Visualizer:
-    """Render a left metrics panel plus the original video frame."""
+    """Render a polished metrics panel plus the original video frame."""
 
-    PANEL_WIDTH = 300
+    PANEL_WIDTH = 360
     PANEL_HEIGHT = 1080
-    COURT_HEIGHT = 630
-    SPEED_PANEL_HEIGHT = 180
+    COURT_HEIGHT = 520
+    SPEED_PANEL_HEIGHT = 160
     CHART_HEIGHT = PANEL_HEIGHT - COURT_HEIGHT - SPEED_PANEL_HEIGHT
-    RALLY_TEXT_HEIGHT = 62
+    RALLY_TEXT_HEIGHT = 70
+    COURT_TOP_PADDING = 74
+    COURT_BOTTOM_PADDING = 24
     SOURCE_WIDTH = 610
     SOURCE_HEIGHT = 1340
     HISTORY_LENGTH = 80
@@ -42,11 +44,16 @@ class Visualizer:
     COURT_CENTER_LINE_Y1 = 460
     COURT_CENTER_LINE_Y2 = 880
     PLAYER_COLORS = {
-        1: (0, 255, 0),
-        2: (255, 0, 0),
+        1: (92, 235, 150),
+        2: (80, 155, 255),
     }
-    GRID_COLOR = (210, 210, 210)
-    TEXT_COLOR = (30, 30, 30)
+    PANEL_BG = (18, 24, 34)
+    CARD_BG = (29, 38, 52)
+    CARD_BG_ALT = (36, 47, 64)
+    GRID_COLOR = (70, 82, 98)
+    TEXT_COLOR = (232, 238, 246)
+    MUTED_TEXT_COLOR = (150, 164, 180)
+    ACCENT_COLOR = (80, 200, 255)
 
     def __init__(self):
         self.position_history = defaultdict(lambda: deque(maxlen=self.HISTORY_LENGTH))
@@ -247,12 +254,22 @@ class Visualizer:
         return court
 
     def _create_court_background(self):
-        court = np.full((self.COURT_HEIGHT, self.PANEL_WIDTH, 3), (38, 128, 54), dtype=np.uint8)
-        white = (255, 255, 255)
-        left = self._scale_x(0)
-        right = self._scale_x(self.SOURCE_WIDTH)
-        top = self._scale_y(0)
-        bottom = self._scale_y(self.SOURCE_HEIGHT)
+        court = np.full((self.COURT_HEIGHT, self.PANEL_WIDTH, 3), self.PANEL_BG, dtype=np.uint8)
+        self._draw_text(court, "MATCH TRACKING", (22, 16), 17, self.MUTED_TEXT_COLOR)
+        self._draw_text(court, "Court Movement Map", (22, 36), 24, self.TEXT_COLOR)
+        cv2.line(court, (20, 66), (self.PANEL_WIDTH - 20, 66), self.GRID_COLOR, 1, cv2.LINE_AA)
+
+        top_pad = self.COURT_TOP_PADDING
+        bottom_pad = self.COURT_BOTTOM_PADDING
+        display_width = int(round(self.SOURCE_WIDTH * self._court_scale()))
+        left = (self.PANEL_WIDTH - display_width) // 2
+        right = left + display_width
+        top = top_pad
+        bottom = self.COURT_HEIGHT - bottom_pad
+        cv2.rectangle(court, (left - 12, top - 12), (right + 12, bottom + 12), self.CARD_BG, -1)
+        cv2.rectangle(court, (left - 12, top - 12), (right + 12, bottom + 12), self.GRID_COLOR, 1)
+
+        white = (236, 248, 242)
 
         cv2.rectangle(court, (left, top), (right, bottom), white, 2)
 
@@ -269,7 +286,18 @@ class Visualizer:
             view_y = self._scale_y(y)
             cv2.line(court, (left, view_y), (right, view_y), white, 1)
 
+        self._draw_legend(court, self.COURT_HEIGHT - 24)
+
         return court
+
+    def _draw_legend(self, image, y):
+        items = ((1, "P1"), (2, "P2"))
+        x = 24
+        for player_id, label in items:
+            color = self.PLAYER_COLORS[player_id]
+            cv2.circle(image, (x, y), 5, color, -1, cv2.LINE_AA)
+            self._draw_text(image, label, (x + 10, y - 8), 14, self.MUTED_TEXT_COLOR)
+            x += 58
 
     def _draw_fading_trail(self, image, points, color):
         if len(points) < 2:
@@ -298,7 +326,10 @@ class Visualizer:
             cv2.circle(frame, current_pos, 7, self._speed_color(current_speed), -1, cv2.LINE_AA)
             cv2.circle(frame, current_pos, 9, (255, 255, 255), 2, cv2.LINE_AA)
 
-        speed_text = "--- km/h" if scene_cut or self.current_ball_speed is None else f"{self.current_ball_speed:.0f} km/h"
+        if scene_cut or self.current_ball_speed is None or self.current_ball_speed <= 0:
+            return frame
+
+        speed_text = f"{self.current_ball_speed:.0f} km/h"
         x = max(16, frame.shape[1] - 300)
         y = 58
         cv2.rectangle(frame, (x - 18, y - 44), (frame.shape[1] - 20, y + 18), (0, 0, 0), -1)
@@ -308,7 +339,7 @@ class Visualizer:
             (x, y),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.35,
-            (210, 210, 210) if scene_cut or self.current_ball_speed is None else self._speed_color(self.current_ball_speed),
+            self._speed_color(self.current_ball_speed),
             3,
             cv2.LINE_AA,
         )
@@ -322,28 +353,38 @@ class Visualizer:
         return (0, 0, 255)
 
     def _draw_speed_panel(self):
-        panel = np.full((self.SPEED_PANEL_HEIGHT, self.PANEL_WIDTH, 3), 246, dtype=np.uint8)
-        self._draw_text(panel, "球速", (10, 8), 22, self.TEXT_COLOR)
+        panel = np.full((self.SPEED_PANEL_HEIGHT, self.PANEL_WIDTH, 3), self.PANEL_BG, dtype=np.uint8)
+        self._draw_text(panel, "SHUTTLE SPEED", (22, 14), 16, self.MUTED_TEXT_COLOR)
+        has_speed = any(
+            value is not None and not np.isnan(value) and float(value) > 0
+            for value in self.ball_speed_history
+        )
+        if not has_speed:
+            self._draw_text(panel, "Speed model disabled", (22, 46), 24, self.TEXT_COLOR)
+            self._draw_text(panel, "Enable TrackNet to show shuttle speed.", (22, 78), 15, self.MUTED_TEXT_COLOR)
+            cv2.line(panel, (22, 118), (self.PANEL_WIDTH - 22, 118), self.GRID_COLOR, 1, cv2.LINE_AA)
+            return panel
+
         self._draw_text(
             panel,
-            f"本分P1最快: {self.rally_max_speed.get(1, 0.0):.1f} km/h",
-            (10, 36),
+            f"P1 max: {self.rally_max_speed.get(1, 0.0):.1f} km/h",
+            (22, 42),
             17,
             self.TEXT_COLOR,
         )
         self._draw_text(
             panel,
-            f"本分P2最快: {self.rally_max_speed.get(2, 0.0):.1f} km/h",
-            (10, 60),
+            f"P2 max: {self.rally_max_speed.get(2, 0.0):.1f} km/h",
+            (190, 42),
             17,
             self.TEXT_COLOR,
         )
 
-        left = 36
-        right = self.PANEL_WIDTH - 12
-        top = 92
+        left = 48
+        right = self.PANEL_WIDTH - 22
+        top = 76
         bottom = self.SPEED_PANEL_HEIGHT - 18
-        cv2.rectangle(panel, (left, top), (right, bottom), (180, 180, 180), 1)
+        cv2.rectangle(panel, (left, top), (right, bottom), self.GRID_COLOR, 1)
         for fraction in (0.0, 0.5, 1.0):
             y = int(round(bottom - fraction * (bottom - top)))
             cv2.line(panel, (left, y), (right, y), self.GRID_COLOR, 1)
@@ -351,19 +392,19 @@ class Visualizer:
             cv2.putText(
                 panel,
                 str(value),
-                (4, y + 4),
+                (12, y + 4),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,
-                self.TEXT_COLOR,
+                self.MUTED_TEXT_COLOR,
                 1,
                 cv2.LINE_AA,
             )
 
         points = self._speed_chart_points(left, right, top, bottom)
         if len(points) >= 2:
-            cv2.polylines(panel, [np.array(points, dtype=np.int32)], False, (30, 30, 30), 2, cv2.LINE_AA)
+            cv2.polylines(panel, [np.array(points, dtype=np.int32)], False, self.ACCENT_COLOR, 2, cv2.LINE_AA)
         elif len(points) == 1:
-            cv2.circle(panel, points[0], 2, (30, 30, 30), -1)
+            cv2.circle(panel, points[0], 2, self.ACCENT_COLOR, -1)
         return panel
 
     def _draw_text(self, image, text, origin, size, color):
@@ -433,17 +474,20 @@ class Visualizer:
         footer_lines=None,
         total_distances=None,
     ):
-        chart = np.full((self.CHART_HEIGHT, self.PANEL_WIDTH, 3), 250, dtype=np.uint8)
-        left = 36
-        right = self.PANEL_WIDTH - 12
-        top = 42
+        chart = np.full((self.CHART_HEIGHT, self.PANEL_WIDTH, 3), self.PANEL_BG, dtype=np.uint8)
+        total_distances = total_distances or {}
+        self._draw_distance_cards(chart, total_distances)
+
+        left = 48
+        right = self.PANEL_WIDTH - 22
+        top = 156
         footer_lines = footer_lines or []
         footer_height = self.RALLY_TEXT_HEIGHT if footer_lines else 0
-        bottom = self.CHART_HEIGHT - 24 - footer_height - self.TOTAL_DISTANCE_TEXT_HEIGHT
+        bottom = self.CHART_HEIGHT - 22 - footer_height
         axis_label_y = bottom + 18
 
-        cv2.putText(chart, title, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.TEXT_COLOR, 1, cv2.LINE_AA)
-        cv2.rectangle(chart, (left, top), (right, bottom), (180, 180, 180), 1)
+        self._draw_text(chart, title.upper(), (22, 124), 16, self.MUTED_TEXT_COLOR)
+        cv2.rectangle(chart, (left, top), (right, bottom), self.GRID_COLOR, 1)
 
         for fraction in (0.0, 0.5, 1.0):
             y = int(round(bottom - fraction * (bottom - top)))
@@ -452,10 +496,10 @@ class Visualizer:
             cv2.putText(
                 chart,
                 f"{label_value:.1f}",
-                (2, y + 4),
+                (8, y + 4),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                self.TEXT_COLOR,
+                0.48,
+                self.MUTED_TEXT_COLOR,
                 1,
                 cv2.LINE_AA,
             )
@@ -466,18 +510,18 @@ class Visualizer:
                 str(self.frames[0]),
                 (left - 6, axis_label_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                self.TEXT_COLOR,
+                0.48,
+                self.MUTED_TEXT_COLOR,
                 1,
                 cv2.LINE_AA,
             )
             cv2.putText(
                 chart,
                 str(self.frames[-1]),
-                (right - 42, axis_label_y),
+                (right - 44, axis_label_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                self.TEXT_COLOR,
+                0.48,
+                self.MUTED_TEXT_COLOR,
                 1,
                 cv2.LINE_AA,
             )
@@ -508,9 +552,25 @@ class Visualizer:
         if footer_lines:
             self._draw_footer_lines(chart, footer_lines)
 
-        self._draw_total_distance_line(chart, total_distances or {})
-
         return chart
+
+    def _draw_distance_cards(self, image, total_distances):
+        self._draw_text(image, "PLAYER LOAD", (22, 12), 16, self.MUTED_TEXT_COLOR)
+        card_w = (self.PANEL_WIDTH - 56) // 2
+        card_h = 78
+        cards = (
+            (1, 22, "PLAYER 1"),
+            (2, 34 + card_w, "PLAYER 2"),
+        )
+        for player_id, x, label in cards:
+            color = self.PLAYER_COLORS[player_id]
+            y = 38
+            cv2.rectangle(image, (x, y), (x + card_w, y + card_h), self.CARD_BG, -1)
+            cv2.rectangle(image, (x, y), (x + card_w, y + card_h), self.CARD_BG_ALT, 1)
+            cv2.rectangle(image, (x, y), (x + 5, y + card_h), color, -1)
+            self._draw_text(image, label, (x + 16, y + 12), 14, self.MUTED_TEXT_COLOR)
+            self._draw_text(image, f"{total_distances.get(player_id, 0.0):.1f}", (x + 16, y + 31), 30, self.TEXT_COLOR)
+            self._draw_text(image, "meters", (x + 18, y + 60), 13, self.MUTED_TEXT_COLOR)
 
     def _chart_points(self, frames, values, left, right, top, bottom, value_min, value_max):
         if not frames or not values:
@@ -556,10 +616,10 @@ class Visualizer:
             cv2.putText(
                 image,
                 line,
-                (10, y),
+                (22, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                self.TEXT_COLOR,
+                self.MUTED_TEXT_COLOR,
                 1,
                 cv2.LINE_AA,
             )
@@ -569,10 +629,10 @@ class Visualizer:
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb_image)
         draw = ImageDraw.Draw(pil_image)
-        y = self.CHART_HEIGHT - self.RALLY_TEXT_HEIGHT + 2
+        y = self.CHART_HEIGHT - self.RALLY_TEXT_HEIGHT + 4
         for line in lines:
-            draw.text((10, y), line, font=self.rally_font, fill=self.TEXT_COLOR[::-1])
-            y += 20
+            draw.text((22, y), line, font=self.rally_font, fill=self.MUTED_TEXT_COLOR[::-1])
+            y += 21
         image[:] = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
     def _draw_total_distance_line(self, image, total_distances):
@@ -684,10 +744,13 @@ class Visualizer:
 
     def _scale_y(self, y):
         scaled_y = int(round(float(y) * self._court_scale()))
-        return min(max(scaled_y, 0), self.COURT_HEIGHT - 1)
+        return self.COURT_TOP_PADDING + min(
+            max(scaled_y, 0),
+            self.COURT_HEIGHT - self.COURT_TOP_PADDING - self.COURT_BOTTOM_PADDING - 1,
+        )
 
     def _court_scale(self):
-        return self.COURT_HEIGHT / self.SOURCE_HEIGHT
+        return (self.COURT_HEIGHT - self.COURT_TOP_PADDING - self.COURT_BOTTOM_PADDING) / self.SOURCE_HEIGHT
 
 
 def parse_args():
